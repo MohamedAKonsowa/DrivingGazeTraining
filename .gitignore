@@ -1,0 +1,26 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+.venv/
+.venv310/
+
+# Large local assets
+*.pt
+*.task
+*.mp4
+
+# Generated outputs
+*_heatmaps_*/
+overlay_*/
+scout_heatmaps_5s/
+scoutplus_heatmaps_5s/
+webgazer_heatmaps_first30/
+webgazer_first30_samples.json
+
+# Third-party local clones
+SCOUT/
+dreyeve/
+GazeTracking/
+eyetracker/
+~/

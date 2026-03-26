@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGazer Demo</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #111; color: #eee; }
+    .topbar {
+      position: sticky; top: 0; z-index: 20000;
+      padding: 10px 14px; background: #1a1a1a; border-bottom: 1px solid #333;
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    }
+    button { padding: 8px 12px; border: 1px solid #555; background: #222; color: #eee; cursor: pointer; }
+    button:hover { background: #2c2c2c; }
+    .status { font-size: 14px; color: #9fd19f; }
+    .stage { position: relative; width: 1280px; max-width: 100%; margin: 14px auto; }
+    #video { width: 100%; display: block; border: 1px solid #333; }
+    #dot {
+      position: absolute; width: 14px; height: 14px; border-radius: 50%;
+      background: #ff2f2f; pointer-events: none; transform: translate(-50%, -50%);
+      box-shadow: 0 0 10px rgba(255, 47, 47, 0.8); display: none;
+    }
+    #heatmapCanvas { display: block; width: 1280px; max-width: 100%; margin: 14px auto; border: 1px solid #333; }
+    #overlayCanvas { display: block; width: 1280px; max-width: 100%; margin: 14px auto; border: 1px solid #333; }
+    .note { width: 1280px; max-width: 100%; margin: 0 auto 16px auto; color: #bbb; font-size: 13px; }
+
+    /* Keep WebGazer preview away from controls. */
+    #webgazerVideoContainer {
+      position: fixed !important;
+      right: 12px !important;
+      bottom: 12px !important;
+      top: auto !important;
+      left: auto !important;
+      z-index: 5000 !important;
+      border: 1px solid #333;
+      background: #000;
+    }
+    #webgazerVideoFeed, #webgazerFaceOverlay, #webgazerFaceFeedbackBox {
+      width: 220px !important;
+      height: auto !important;
+      max-height: 170px !important;
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <button id="startBtn">Start WebGazer</button>
+    <button id="calibBtn">Calibrate (click 9 points)</button>
+    <button id="recordBtn">Record First 30s</button>
+    <button id="exportBtn">Export Heatmap PNG</button>
+    <button id="exportSamplesBtn">Export Samples JSON</button>
+    <span class="status" id="status">Ready.</span>
+  </div>
+
+  <div class="stage" id="stage">
+    <video id="video" controls>
+      <source src="First Person POV_ Driving.mp4" type="video/mp4" />
+      Your browser does not support the video tag.
+    </video>
+    <div id="dot"></div>
+  </div>
+
+  <canvas id="heatmapCanvas" width="1280" height="720"></canvas>
+  <canvas id="overlayCanvas" width="1280" height="720"></canvas>
+  <div class="note">
+    Flow: Start WebGazer -> Calibrate -> Record First 30s while watching video -> Auto preview SCOUT vs WebGazer overlay.
+  </div>
+
+  <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+  <script>
+    const statusEl = document.getElementById("status");
+    const video = document.getElementById("video");
+    const stage = document.getElementById("stage");
+    const dot = document.getElementById("dot");
+    const heatmapCanvas = document.getElementById("heatmapCanvas");
+    const hctx = heatmapCanvas.getContext("2d");
+    const overlayCanvas = document.getElementById("overlayCanvas");
+    const octx = overlayCanvas.getContext("2d");
+
+    let webgazerStarted = false;
+    let recording = false;
+    let samples = [];
+
+    function setStatus(msg, ok = true) {
+      statusEl.textContent = msg;
+      statusEl.style.color = ok ? "#9fd19f" : "#ff9f9f";
+    }
+
+    function drawHeatmap(points) {
+      hctx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
+      hctx.fillStyle = "#000";
+      hctx.fillRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
+      for (const p of points) {
+        const grad = hctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 35);
+        grad.addColorStop(0, "rgba(255, 255, 0, 0.30)");
+        grad.addColorStop(1, "rgba(255, 0, 0, 0.0)");
+        hctx.fillStyle = grad;
+        hctx.beginPath();
+        hctx.arc(p.x, p.y, 35, 0, Math.PI * 2);
+        hctx.fill();
+      }
+    }
+
+    function buildSegmentHeatmap(points, tStart, tEnd, width, height) {
+      const tmp = document.createElement("canvas");
+      tmp.width = width;
+      tmp.height = height;
+      const ctx = tmp.getContext("2d");
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, width, height);
+      for (const p of points) {
+        if (p.t < tStart || p.t >= tEnd) continue;
+        const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 35);
+        grad.addColorStop(0, "rgba(255, 255, 255, 0.35)");
+        grad.addColorStop(1, "rgba(0, 0, 0, 0.0)");
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 35, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      return tmp;
+    }
+
+    async function loadImage(url) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error("Failed to load " + url));
+        img.src = url + "?t=" + Date.now();
+      });
+    }
+
+    async function autoBuildOverlayPreview() {
+      // Uses SCOUT at t=0,5,10,15,20,25 and user segments from recorded samples.
+      const times = [0, 5, 10, 15, 20, 25];
+      const cols = 3;
+      const tileW = Math.floor(overlayCanvas.width / cols);
+      const tileH = Math.floor(overlayCanvas.height / 2);
+      octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+      octx.fillStyle = "#000";
+      octx.fillRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+      for (let i = 0; i < times.length; i++) {
+        const t = times[i];
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x0 = col * tileW;
+        const y0 = row * tileH;
+
+        const userSeg = buildSegmentHeatmap(samples, t, t + 5, heatmapCanvas.width, heatmapCanvas.height);
+        const userData = userSeg.getContext("2d").getImageData(0, 0, userSeg.width, userSeg.height).data;
+
+        let scoutImg = null;
+        try {
+          scoutImg = await loadImage(`scout_heatmaps_5s/scout_heatmap_t${String(t).padStart(5, "0")}s.png`);
+        } catch (_e) {
+          // If one image missing, continue tile with user-only.
+        }
+
+        const tmp = document.createElement("canvas");
+        tmp.width = heatmapCanvas.width;
+        tmp.height = heatmapCanvas.height;
+        const tctx = tmp.getContext("2d");
+        tctx.fillStyle = "#000";
+        tctx.fillRect(0, 0, tmp.width, tmp.height);
+        if (scoutImg) tctx.drawImage(scoutImg, 0, 0, tmp.width, tmp.height);
+        const scoutData = tctx.getImageData(0, 0, tmp.width, tmp.height);
+
+        // Blend to BLUE (SCOUT) + RED (WebGazer) so overlap looks magenta.
+        const out = tctx.createImageData(tmp.width, tmp.height);
+        for (let p = 0; p < out.data.length; p += 4) {
+          const sR = scoutData.data[p];
+          const sG = scoutData.data[p + 1];
+          const sB = scoutData.data[p + 2];
+          const scoutGray = (sR + sG + sB) / 3;
+          const userGray = userData[p]; // gray heatmap drawn in white
+          out.data[p] = userGray;         // R (user)
+          out.data[p + 1] = 0;            // G
+          out.data[p + 2] = scoutGray;    // B (SCOUT)
+          out.data[p + 3] = 255;
+        }
+        tctx.putImageData(out, 0, 0);
+        tctx.fillStyle = "rgba(255,255,255,0.9)";
+        tctx.font = "24px Arial";
+        tctx.fillText(`t=${String(t).padStart(2, "0")}s`, 20, 36);
+
+        octx.drawImage(tmp, x0, y0, tileW, tileH);
+      }
+    }
+
+    function buildCalibrationPoints() {
+      const pts = [];
+      const cols = [0.1, 0.5, 0.9];
+      const rows = [0.15, 0.5, 0.85];
+      for (const y of rows) {
+        for (const x of cols) pts.push({ x, y });
+      }
+      return pts;
+    }
+
+    async function runCalibration() {
+      if (!webgazerStarted) {
+        setStatus("Start WebGazer first.", false);
+        return;
+      }
+      const pts = buildCalibrationPoints();
+      setStatus("Calibration: click each point 3 times.");
+      for (const p of pts) {
+        for (let k = 0; k < 3; k++) {
+          await new Promise((resolve) => {
+            const b = document.createElement("button");
+            b.textContent = "+";
+            b.style.position = "fixed";
+            b.style.left = (p.x * window.innerWidth - 16) + "px";
+            b.style.top = (p.y * window.innerHeight - 16) + "px";
+            b.style.width = "32px";
+            b.style.height = "32px";
+            b.style.borderRadius = "50%";
+            b.style.zIndex = 9999;
+            b.onclick = () => { b.remove(); resolve(); };
+            document.body.appendChild(b);
+          });
+        }
+      }
+      setStatus("Calibration complete.");
+    }
+
+    function safeCall(methodName, ...args) {
+      if (typeof webgazer?.[methodName] === "function") {
+        try {
+          return webgazer[methodName](...args);
+        } catch (_e) {
+          return null;
+        }
+      }
+      return null;
+    }
+
+    function placeWebgazerPreview() {
+      const c = document.getElementById("webgazerVideoContainer");
+      if (!c) return;
+      c.style.position = "fixed";
+      c.style.right = "12px";
+      c.style.bottom = "12px";
+      c.style.left = "auto";
+      c.style.top = "auto";
+      c.style.zIndex = "5000";
+    }
+
+    async function startWebGazer() {
+      if (webgazerStarted) {
+        setStatus("WebGazer already running.");
+        return;
+      }
+      try {
+        if (typeof webgazer === "undefined") {
+          throw new Error("webgazer library not loaded");
+        }
+
+        // Probe camera permission first for clearer error messages.
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error("getUserMedia is not available in this browser");
+        }
+        let probeStream = null;
+        try {
+          probeStream = await navigator.mediaDevices.getUserMedia({ video: true });
+        } catch (camErr) {
+          throw new Error("Camera permission/stream failed: " + camErr.message);
+        } finally {
+          if (probeStream) {
+            probeStream.getTracks().forEach((t) => t.stop());
+          }
+        }
+
+        // Avoid brittle method chaining across webgazer versions.
+        // Use clmtrackr backend to avoid MediaPipe asset 404 issues.
+        safeCall("setTracker", "clmtrackr");
+        safeCall("setRegression", "ridge");
+        safeCall("setGazeListener", (data) => {
+          if (!data) return;
+
+          const rect = stage.getBoundingClientRect();
+          const x = data.x - rect.left;
+          const y = data.y - rect.top;
+          if (x < 0 || y < 0 || x > rect.width || y > rect.height) return;
+
+          dot.style.display = "block";
+          dot.style.left = x + "px";
+          dot.style.top = y + "px";
+
+          if (recording) {
+            const sx = x * (heatmapCanvas.width / rect.width);
+            const sy = y * (heatmapCanvas.height / rect.height);
+            samples.push({ x: sx, y: sy, t: video.currentTime });
+          }
+        });
+
+        const beginResult = safeCall("begin");
+        if (beginResult && typeof beginResult.then === "function") {
+          await beginResult;
+        }
+
+        safeCall("showVideoPreview", true);
+        safeCall("showPredictionPoints", false);
+        safeCall("showFaceOverlay", false);
+        safeCall("showFaceFeedbackBox", false);
+        // Some versions create preview asynchronously; place it twice.
+        placeWebgazerPreview();
+        setTimeout(placeWebgazerPreview, 250);
+        webgazerStarted = true;
+        setStatus("WebGazer started.");
+      } catch (e) {
+        setStatus("Failed to start WebGazer: " + e, false);
+      }
+    }
+
+    function recordFirst30s() {
+      if (!webgazerStarted) {
+        setStatus("Start WebGazer first.", false);
+        return;
+      }
+      samples = [];
+      video.currentTime = 0;
+      video.play();
+      recording = true;
+      setStatus("Recording gaze for first 30 seconds...");
+
+      const stopAt = 30;
+      const timer = setInterval(async () => {
+        if (video.currentTime >= stopAt || video.paused || video.ended) {
+          clearInterval(timer);
+          recording = false;
+          video.pause();
+          drawHeatmap(samples);
+          await autoBuildOverlayPreview();
+          setStatus(`Done. Recorded ${samples.length} gaze points. Auto overlay preview updated.`);
+        }
+      }, 100);
+    }
+
+    function exportHeatmap() {
+      const url = heatmapCanvas.toDataURL("image/png");
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "webgazer_first30_heatmap.png";
+      a.click();
+      setStatus("Exported webgazer_first30_heatmap.png");
+    }
+
+    function exportSamples() {
+      if (!samples.length) {
+        setStatus("No samples yet. Record first.", false);
+        return;
+      }
+      const payload = {
+        width: heatmapCanvas.width,
+        height: heatmapCanvas.height,
+        duration_sec: 30,
+        interval_sec: 5,
+        samples: samples
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "webgazer_first30_samples.json";
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus("Exported webgazer_first30_samples.json");
+    }
+
+    document.getElementById("startBtn").addEventListener("click", startWebGazer);
+    document.getElementById("calibBtn").addEventListener("click", runCalibration);
+    document.getElementById("recordBtn").addEventListener("click", recordFirst30s);
+    document.getElementById("exportBtn").addEventListener("click", exportHeatmap);
+    document.getElementById("exportSamplesBtn").addEventListener("click", exportSamples);
+  </script>
+</body>
+</html>
