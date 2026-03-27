@@ -23,6 +23,13 @@
     }
     #heatmapCanvas { display: block; width: 1280px; max-width: 100%; margin: 14px auto; border: 1px solid #333; }
     #overlayCanvas { display: block; width: 1280px; max-width: 100%; margin: 14px auto; border: 1px solid #333; }
+    #scorePanel {
+      width: 1280px; max-width: 100%; margin: 10px auto 8px auto;
+      border: 1px solid #333; background: #171717; padding: 10px 12px; box-sizing: border-box;
+      font-size: 14px; line-height: 1.35;
+    }
+    #scoreHeadline { font-size: 16px; margin-bottom: 6px; color: #e6e6e6; }
+    #scoreDetails { color: #c9c9c9; white-space: pre-wrap; }
     .note { width: 1280px; max-width: 100%; margin: 0 auto 16px auto; color: #bbb; font-size: 13px; }
 
     /* Keep WebGazer preview away from controls. */
@@ -63,6 +70,10 @@
 
   <canvas id="heatmapCanvas" width="1280" height="720"></canvas>
   <canvas id="overlayCanvas" width="1280" height="720"></canvas>
+  <div id="scorePanel">
+    <div id="scoreHeadline">Score: not run yet</div>
+    <div id="scoreDetails">After recording, this panel shows Focus / Coverage / Stability and overall score.</div>
+  </div>
   <div class="note">
     Flow: Start WebGazer -> Calibrate -> Record First 30s while watching video -> Auto preview SCOUT vs WebGazer overlay.
   </div>
@@ -77,6 +88,8 @@
     const hctx = heatmapCanvas.getContext("2d");
     const overlayCanvas = document.getElementById("overlayCanvas");
     const octx = overlayCanvas.getContext("2d");
+    const scoreHeadline = document.getElementById("scoreHeadline");
+    const scoreDetails = document.getElementById("scoreDetails");
 
     let webgazerStarted = false;
     let recording = false;
@@ -140,6 +153,7 @@
       octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
       octx.fillStyle = "#000";
       octx.fillRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+      const allSegmentScores = [];
 
       for (let i = 0; i < times.length; i++) {
         const t = times[i];
@@ -166,6 +180,8 @@
         tctx.fillRect(0, 0, tmp.width, tmp.height);
         if (scoutImg) tctx.drawImage(scoutImg, 0, 0, tmp.width, tmp.height);
         const scoutData = tctx.getImageData(0, 0, tmp.width, tmp.height);
+        const segScore = computeSegmentScore(userData, scoutData.data);
+        allSegmentScores.push({ t, ...segScore });
 
         // Blend to BLUE (SCOUT) + RED (WebGazer) so overlap looks magenta.
         const out = tctx.createImageData(tmp.width, tmp.height);
@@ -184,9 +200,100 @@
         tctx.fillStyle = "rgba(255,255,255,0.9)";
         tctx.font = "24px Arial";
         tctx.fillText(`t=${String(t).padStart(2, "0")}s`, 20, 36);
+        tctx.fillText(`${Math.round(segScore.overall * 100)}/100`, 20, 70);
 
         octx.drawImage(tmp, x0, y0, tileW, tileH);
       }
+      renderScorePanel(allSegmentScores);
+    }
+
+    function computePercentile(values, pct) {
+      if (!values.length) return 0;
+      const sorted = [...values].sort((a, b) => a - b);
+      const idx = Math.floor((sorted.length - 1) * pct);
+      return sorted[Math.max(0, Math.min(sorted.length - 1, idx))];
+    }
+
+    function computeSegmentScore(userData, scoutData) {
+      // userData/scoutData are RGBA arrays from same-sized image.
+      const n = userData.length / 4;
+      const scoutGray = new Float32Array(n);
+      const userGray = new Float32Array(n);
+      const scoutVals = [];
+
+      let sumUser = 0;
+      for (let i = 0, p = 0; i < n; i++, p += 4) {
+        const s = (scoutData[p] + scoutData[p + 1] + scoutData[p + 2]) / 3;
+        const u = userData[p]; // user segment is white-on-black, so R is enough
+        scoutGray[i] = s;
+        userGray[i] = u;
+        scoutVals.push(s);
+        sumUser += u;
+      }
+
+      if (sumUser <= 1e-6) {
+        return { focus: 0, coverage: 0, stability: 0, overall: 0 };
+      }
+
+      const coreThr = computePercentile(scoutVals, 0.8);
+      const nearThr = computePercentile(scoutVals, 0.6);
+
+      let coreMass = 0;
+      let nearMass = 0;
+      let farMass = 0;
+      for (let i = 0; i < n; i++) {
+        const s = scoutGray[i];
+        const u = userGray[i];
+        if (s >= coreThr) coreMass += u;
+        else if (s >= nearThr) nearMass += u;
+        else farMass += u;
+      }
+
+      const focus = coreMass / sumUser;
+      const nearRatio = nearMass / sumUser;
+      const farRatio = farMass / sumUser;
+
+      // Coverage encourages some near-context scan without overdoing it.
+      // Target near-zone ratio around 0.25, with soft tolerance +/-0.20.
+      const nearCenter = 0.25;
+      const nearTol = 0.20;
+      const coverage = Math.max(0, 1 - Math.abs(nearRatio - nearCenter) / nearTol);
+
+      // Stability penalizes too much attention in low-saliency far zone.
+      const stability = Math.max(0, 1 - farRatio);
+
+      const overall = (0.6 * focus) + (0.3 * coverage) + (0.1 * stability);
+      return { focus, coverage, stability, overall };
+    }
+
+    function gradeFromScore(score100) {
+      if (score100 >= 85) return "Excellent";
+      if (score100 >= 70) return "Good";
+      if (score100 >= 50) return "Needs Improvement";
+      return "Poor";
+    }
+
+    function renderScorePanel(segmentScores) {
+      if (!segmentScores.length) {
+        scoreHeadline.textContent = "Score: unavailable";
+        scoreDetails.textContent = "No segment scores were computed.";
+        return;
+      }
+      const avg = (k) => segmentScores.reduce((a, s) => a + s[k], 0) / segmentScores.length;
+      const focus = avg("focus");
+      const coverage = avg("coverage");
+      const stability = avg("stability");
+      const overall = avg("overall");
+      const overall100 = Math.round(overall * 100);
+      const grade = gradeFromScore(overall100);
+
+      scoreHeadline.textContent = `Driver Attention Score: ${overall100}/100 (${grade})`;
+      const segLines = segmentScores
+        .map((s) => `t=${String(s.t).padStart(2, "0")}s -> ${Math.round(s.overall * 100)}/100`)
+        .join(" | ");
+      scoreDetails.textContent =
+        `Focus=${Math.round(focus * 100)}  Coverage=${Math.round(coverage * 100)}  Stability=${Math.round(stability * 100)}\n` +
+        segLines;
     }
 
     function buildCalibrationPoints() {

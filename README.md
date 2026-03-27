@@ -7,10 +7,11 @@ This project includes:
 - Browser-based tracking with WebGazer
 - SCOUT/SCOUT+ saliency heatmap generation every 5 seconds
 - Overlay comparison between expected (SCOUT) and user gaze heatmaps
+- Instant in-page driver attention scoring after each 30s run
 
 ## Project Structure
 
-- `webgazer_demo.html` - Browser demo for calibration, 30s recording, and in-page overlay preview
+- `webgazer_demo.html` - Browser demo for calibration, 30s recording, auto overlay preview, and scoring
 - `webgazer_heatmaps_first30.py` - Convert WebGazer JSON samples to per-5s heatmaps
 - `scout_heatmaps_every_5s.py` - Generate SCOUT or SCOUT+ expected heatmaps from video
 - `overlay_heatmaps.py` - Overlay reference vs user heatmaps by timestamp
@@ -76,7 +77,18 @@ Flow:
 1. Click **Start WebGazer**
 2. Click **Calibrate**
 3. Click **Record First 30s**
-4. (Optional) Click **Export Samples JSON** to save `webgazer_first30_samples.json`
+4. View instant SCOUT-vs-WebGazer overlay tiles and score panel on page
+5. (Optional) Click **Export Samples JSON** to save `webgazer_first30_samples.json`
+
+The score panel shows:
+- Overall `Driver Attention Score` (0-100 + grade)
+- `Focus` (looked at high-saliency SCOUT regions)
+- `Coverage` (looked around near-context zones)
+- `Stability` (avoided low-saliency off-target regions)
+- Per-segment scores for `t=00s ... t=25s`
+
+Current weighting:
+- `Overall = 0.6*Focus + 0.3*Coverage + 0.1*Stability`
 
 ## 3) Convert WebGazer Samples to 5s Heatmaps
 
